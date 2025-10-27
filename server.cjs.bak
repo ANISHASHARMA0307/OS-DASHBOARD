@@ -1,0 +1,181 @@
+// server.cjs
+const express = require('express');
+const si = require('systeminformation');
+const fs = require('fs');
+const path = require('path');
+const cron = require('node-cron');
+const PDFDocument = require('pdfkit');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Paths
+const LOG_DIR = path.join(__dirname, 'logs');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
+const LOG_FILE = path.join(LOG_DIR, 'resource.log');
+
+// In-memory thresholds (can be POSTed)
+let thresholds = { cpu: 90, ram: 85, battery: 15 };
+
+// Helper to append log
+function appendLog(line) {
+  fs.appendFileSync(LOG_FILE, line + '\n');
+}
+
+// API: stats (cpu, ram, battery, ssd, gpu)
+app.get('/api/stats', async (req, res) => {
+  try {
+    const [cpuLoad, mem, battery, fsSize, graphics] = await Promise.all([
+      si.currentLoad(),
+      si.mem(),
+      si.battery(),
+      si.fsSize(),
+      si.graphics()
+    ]);
+
+    const cpu = parseFloat(cpuLoad.currentLoad.toFixed(2));
+    const ram = parseFloat(((mem.active / mem.total) * 100).toFixed(2));
+    const batteryPct = battery.hasbattery ? (battery.percent ?? null) : null;
+
+    const ssd = (fsSize || []).map(d => ({
+      fs: d.fs,
+      mount: d.mount,
+      size: d.size,
+      used: d.used,
+      use: d.use
+    }));
+
+    const gpu = (graphics && graphics.controllers) ? graphics.controllers.map(g => ({
+      model: g.model || 'unknown',
+      vendor: g.vendor || '',
+      vram: g.vram || 0,
+      utilizationGpu: g.utilizationGpu ?? null
+    })) : [];
+
+    res.json({ cpu, ram, battery: batteryPct, ssd, gpu });
+  } catch (err) {
+    console.error('/api/stats error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: top 5 processes by CPU
+app.get('/api/processes', async (req, res) => {
+  try {
+    const procs = await si.processes();
+    const top = (procs.list || [])
+      .sort((a,b)=> b.pcpu - a.pcpu)
+      .slice(0,5)
+      .map(p => ({ pid: p.pid, name: p.name, cpu: parseFloat(p.pcpu.toFixed(2)), mem: parseFloat(p.pmem.toFixed(2)) }));
+    res.json(top);
+  } catch (err) {
+    console.error('/api/processes error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: last logs (return last N lines)
+app.get('/api/logs', (req, res) => {
+  try {
+    if (!fs.existsSync(LOG_FILE)) return res.json([]);
+    const n = parseInt(req.query.n) || 200;
+    const lines = fs.readFileSync(LOG_FILE, 'utf-8').trim().split('\n');
+    const out = lines.slice(-n);
+    res.json(out);
+  } catch (err) {
+    console.error('/api/logs error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: snapshot (csv or pdf)
+app.get('/api/snapshot', async (req, res) => {
+  try {
+    const fmt = (req.query.fmt || 'csv').toLowerCase();
+    const stats = await si.currentLoad();
+    const mem = await si.mem();
+    const battery = await si.battery();
+    const procs = await si.processes();
+
+    const time = new Date().toISOString();
+    const cpuVal = stats.currentLoad.toFixed(2);
+    const ramVal = ((mem.active / mem.total) * 100).toFixed(2);
+    const batteryVal = battery.hasbattery ? (battery.percent ?? 'N/A') : 'N/A';
+
+    const topProcs = (procs.list || []).sort((a,b)=>b.pcpu - a.pcpu).slice(0,10);
+
+    if (fmt === 'pdf') {
+      res.setHeader('Content-disposition','attachment; filename=dash-snapshot.pdf');
+      res.setHeader('Content-type','application/pdf');
+      const doc = new PDFDocument();
+      doc.pipe(res);
+      doc.fontSize(18).text('OS Dashboard Snapshot', {underline:true});
+      doc.moveDown();
+      doc.fontSize(12).text(`Time: ${time}`);
+      doc.text(`CPU: ${cpuVal}%`);
+      doc.text(`RAM: ${ramVal}%`);
+      doc.text(`Battery: ${batteryVal}`);
+      doc.moveDown();
+      doc.text('Top processes:');
+      topProcs.forEach(p => doc.text(`${p.pid} ${p.name} — CPU:${p.pcpu}% MEM:${p.pmem}%`));
+      doc.end();
+      return;
+    } else {
+      let csv = `time,cpu%,ram%,battery%\n`;
+      csv += `${time},${cpuVal},${ramVal},${batteryVal}\n\n`;
+      csv += `pid,name,cpu%,mem%\n`;
+      topProcs.forEach(p => {
+        csv += `${p.pid},"${p.name}",${p.pcpu},${p.pmem}\n`;
+      });
+      res.setHeader('Content-disposition','attachment; filename=dash-snapshot.csv');
+      res.setHeader('Content-type','text/csv');
+      res.send(csv);
+      return;
+    }
+  } catch (err) {
+    console.error('/api/snapshot error', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: thresholds (get / set)
+app.get('/api/thresholds', (req, res) => res.json(thresholds));
+app.post('/api/thresholds', (req, res) => {
+  try {
+    const b = req.body || {};
+    if (typeof b.cpu === 'number') thresholds.cpu = b.cpu;
+    if (typeof b.ram === 'number') thresholds.ram = b.ram;
+    if (typeof b.battery === 'number') thresholds.battery = b.battery;
+    res.json({ success:true, thresholds });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cron job: log stats every 1 minute
+cron.schedule('* * * * *', async () => {
+  try {
+    const cpu = await si.currentLoad();
+    const mem = await si.mem();
+    const battery = await si.battery();
+    const cpuVal = parseFloat(cpu.currentLoad.toFixed(2));
+    const ramVal = parseFloat(((mem.active / mem.total) * 100).toFixed(2));
+    const battVal = battery.hasbattery ? (battery.percent ?? 'N/A') : 'N/A';
+    const line = `[${new Date().toLocaleString()}] CPU:${cpuVal}% RAM:${ramVal}% Battery:${battVal}`;
+    appendLog(line);
+
+    // Optionally: you can add server-side desktop notifications here
+  } catch (err) {
+    console.error('cron error', err);
+  }
+});
+
+// Serve index for root explicitly (static middleware already serves files)
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=> console.log(`Server running at http://localhost:${PORT}`));

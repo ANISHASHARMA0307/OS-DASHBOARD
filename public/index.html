@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OS Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">OS Dashboard</div>
+    <div class="controls">
+      <button id="downloadCsv" class="btn">Download Snapshot (CSV)</button>
+      <button id="downloadPdf" class="btn">Download Snapshot (PDF)</button>
+      <button id="refreshLogs" class="btn">Refresh Logs</button>
+      <button id="themeToggle" class="btn">Toggle Theme</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="grid">
+      <div class="card">
+        <h3>CPU: <span id="cpu">0%</span></h3>
+        <canvas id="cpuChart" class="small-chart"></canvas>
+      </div>
+
+      <div class="card">
+        <h3>RAM: <span id="ram">0%</span></h3>
+        <canvas id="ramChart" class="small-chart"></canvas>
+      </div>
+
+      <div class="card center">
+        <h3>Battery: <span id="battery">N/A</span></h3>
+        <h3>GPU: <span id="gpuInfo">N/A</span></h3>
+      </div>
+
+      <div class="card">
+        <h3>Top Processes (by CPU)</h3>
+        <ul id="processList" class="proc-list"></ul>
+      </div>
+
+      <div class="card logs-card">
+        <h3>Logs (last 200 lines)</h3>
+        <textarea id="logArea" readonly></textarea>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
