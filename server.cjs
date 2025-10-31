@@ -1,4 +1,4 @@
-/* server.cjs - fixed, robust version */
+/* server.cjs - improved version with better battery detection */
 const express = require('express');
 const si = require('systeminformation');
 const fs = require('fs');
@@ -25,20 +25,44 @@ function appendLogAsync(line) {
   });
 }
 
+/* Helper: better battery detection */
+async function getBatteryInfo() {
+  try {
+    const battery = await si.battery();
+
+    // Some Windows laptops report hasbattery = false even when they do
+    if (
+      battery &&
+      (battery.hasbattery || battery.percent > 0 || battery.maxcapacity > 0)
+    ) {
+      return battery.percent ?? null;
+    }
+
+    // fallback: try power supply info (Linux/Win hybrid fallback)
+    const ps = await si.powerSupply();
+    if (ps && ps.percent) return ps.percent;
+
+    return null; // if truly unavailable
+  } catch (err) {
+    console.warn('Battery info unavailable:', err.message);
+    return null;
+  }
+}
+
 /* /api/stats */
 app.get('/api/stats', async (req, res) => {
   try {
-    const [cpuLoad, mem, battery, fsSize, graphics] = await Promise.all([
+    const [cpuLoad, mem, fsSize, graphics] = await Promise.all([
       si.currentLoad(),
       si.mem(),
-      si.battery(),
       si.fsSize(),
       si.graphics()
     ]);
 
-    const cpu = Number(cpuLoad.currentLoad?.toFixed?.(2) ?? cpuLoad.currentLoad ?? 0);
+    const batteryPct = await getBatteryInfo();
+
+    const cpu = Number(cpuLoad.currentLoad?.toFixed?.(2) ?? 0);
     const ram = Number((((mem?.active ?? 0) / (mem?.total ?? 1)) * 100).toFixed(2));
-    const batteryPct = battery?.hasbattery ? (battery.percent ?? null) : null;
 
     const ssd = (fsSize || []).map(d => ({
       fs: d.fs, mount: d.mount, size: d.size, used: d.used, use: d.use
@@ -58,32 +82,20 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
-/* /api/processes - robust safe mapping */
+/* /api/processes */
 app.get('/api/processes', async (req, res) => {
   try {
     const procInfo = await si.processes();
     const list = procInfo?.list || [];
 
-    const safeNum = v => {
-      if (v === undefined || v === null) return 0;
-      const n = Number(v);
-      return Number.isFinite(n) ? n : 0;
-    };
+    const mapped = list.map(p => ({
+      pid: p.pid ?? null,
+      name: p.name ?? p.command ?? 'unknown',
+      cpu: Number(p.pcpu ?? p.cpu ?? 0).toFixed(2),
+      mem: Number(p.pmem ?? p.mem ?? 0).toFixed(2)
+    }));
 
-    const mapped = list.map(p => {
-      const cpuRaw = p.pcpu ?? p.cpu ?? p.cpuPercent ?? p.cpuUsage ?? 0;
-      const memRaw = p.pmem ?? p.mem ?? p.memPercent ?? 0;
-      const cpu = Number(safeNum(cpuRaw));
-      const memv = Number(safeNum(memRaw));
-      return {
-        pid: p.pid ?? null,
-        name: p.name ?? p.command ?? 'unknown',
-        cpu: Math.round(cpu * 100) / 100,
-        mem: Math.round(memv * 100) / 100
-      };
-    });
-
-    const top = mapped.sort((a,b) => (b.cpu ?? 0) - (a.cpu ?? 0)).slice(0,5);
+    const top = mapped.sort((a, b) => b.cpu - a.cpu).slice(0, 5);
     res.json(top);
   } catch (err) {
     console.error('/api/processes error', err);
@@ -91,7 +103,7 @@ app.get('/api/processes', async (req, res) => {
   }
 });
 
-/* /api/logs - last N lines */
+/* /api/logs */
 app.get('/api/logs', (req, res) => {
   try {
     if (!fs.existsSync(LOG_FILE)) return res.json([]);
@@ -104,47 +116,47 @@ app.get('/api/logs', (req, res) => {
   }
 });
 
-/* /api/snapshot - csv or pdf */
+/* /api/snapshot (csv/pdf) */
 app.get('/api/snapshot', async (req, res) => {
   try {
     const fmt = (req.query.fmt || 'csv').toLowerCase();
-    const [stats, mem, battery, procs] = await Promise.all([si.currentLoad(), si.mem(), si.battery(), si.processes()]);
+    const [stats, mem, procs] = await Promise.all([
+      si.currentLoad(),
+      si.mem(),
+      si.processes()
+    ]);
+    const batteryVal = await getBatteryInfo();
 
     const time = new Date().toISOString();
-    const cpuVal = Number(stats.currentLoad?.toFixed?.(2) ?? stats.currentLoad ?? 0);
-    const ramVal = Number((((mem?.active ?? 0)/(mem?.total ?? 1))*100).toFixed(2));
-    const batteryVal = battery?.hasbattery ? (battery.percent ?? 'N/A') : 'N/A';
-    const topProcs = (procs?.list || []).sort((a,b)=> (b.pcpu ?? b.cpu ?? 0) - (a.pcpu ?? a.cpu ?? 0)).slice(0,10);
+    const cpuVal = Number(stats.currentLoad?.toFixed?.(2) ?? 0);
+    const ramVal = Number((((mem?.active ?? 0) / (mem?.total ?? 1)) * 100).toFixed(2));
+    const topProcs = (procs?.list || [])
+      .sort((a, b) => (b.pcpu ?? 0) - (a.pcpu ?? 0))
+      .slice(0, 10);
 
     if (fmt === 'pdf') {
-      res.setHeader('Content-disposition','attachment; filename=dash-snapshot.pdf');
-      res.setHeader('Content-type','application/pdf');
+      res.setHeader('Content-disposition', 'attachment; filename=dash-snapshot.pdf');
+      res.setHeader('Content-type', 'application/pdf');
       const doc = new PDFDocument();
       doc.pipe(res);
-      doc.fontSize(16).text('OS Dashboard Snapshot', {underline:true});
+      doc.fontSize(16).text('OS Dashboard Snapshot', { underline: true });
       doc.moveDown();
       doc.text(`Time: ${time}`);
       doc.text(`CPU: ${cpuVal}%`);
       doc.text(`RAM: ${ramVal}%`);
-      doc.text(`Battery: ${batteryVal}`);
+      doc.text(`Battery: ${batteryVal ?? 'N/A'}%`);
       doc.moveDown();
-      doc.text('Top processes (sample):');
-      topProcs.forEach(p => doc.text(`${p.pid} ${p.name} — CPU:${p.pcpu ?? p.cpu ?? 0}% MEM:${p.pmem ?? p.mem ?? 0}%`));
+      doc.text('Top processes:');
+      topProcs.forEach(p => doc.text(`${p.pid} ${p.name} — CPU:${p.pcpu ?? 0}% MEM:${p.pmem ?? 0}%`));
       doc.end();
-      return;
     } else {
-      let csv = `time,cpu%,ram%,battery%\n`;
-      csv += `${time},${cpuVal},${ramVal},${batteryVal}\n\n`;
-      csv += `pid,name,cpu,mem\n`;
+      let csv = `time,cpu%,ram%,battery%\n${time},${cpuVal},${ramVal},${batteryVal ?? 'N/A'}\n\npid,name,cpu,mem\n`;
       topProcs.forEach(p => {
-        const cpu = p.pcpu ?? p.cpu ?? 0;
-        const memv = p.pmem ?? p.mem ?? 0;
-        csv += `${p.pid},"${(p.name||'').replace(/"/g,'""')}",${cpu},${memv}\n`;
+        csv += `${p.pid},"${(p.name || '').replace(/"/g, '""')}",${p.pcpu ?? 0},${p.pmem ?? 0}\n`;
       });
-      res.setHeader('Content-disposition','attachment; filename=dash-snapshot.csv');
-      res.setHeader('Content-type','text/csv');
+      res.setHeader('Content-disposition', 'attachment; filename=dash-snapshot.csv');
+      res.setHeader('Content-type', 'text/csv');
       res.send(csv);
-      return;
     }
   } catch (err) {
     console.error('/api/snapshot error', err);
@@ -153,35 +165,35 @@ app.get('/api/snapshot', async (req, res) => {
 });
 
 /* thresholds get/post */
-app.get('/api/thresholds', (req,res) => res.json(thresholds));
-app.post('/api/thresholds', (req,res) => {
+app.get('/api/thresholds', (req, res) => res.json(thresholds));
+app.post('/api/thresholds', (req, res) => {
   try {
     const b = req.body || {};
     if (typeof b.cpu === 'number') thresholds.cpu = b.cpu;
     if (typeof b.ram === 'number') thresholds.ram = b.ram;
     if (typeof b.battery === 'number') thresholds.battery = b.battery;
-    res.json({ success:true, thresholds });
+    res.json({ success: true, thresholds });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/* cron: log every minute (nonblocking) */
+/* log cron job */
 cron.schedule('* * * * *', async () => {
   try {
-    const [cpu, mem, battery] = await Promise.all([si.currentLoad(), si.mem(), si.battery()]);
-    const cpuVal = Number(cpu.currentLoad?.toFixed?.(2) ?? cpu.currentLoad ?? 0);
-    const ramVal = Number((((mem?.active ?? 0)/(mem?.total ?? 1))*100).toFixed(2));
-    const battVal = battery?.hasbattery ? (battery.percent ?? 'N/A') : 'N/A';
-    const line = `[${new Date().toLocaleString()}] CPU:${cpuVal}% RAM:${ramVal}% Battery:${battVal}`;
+    const [cpu, mem] = await Promise.all([si.currentLoad(), si.mem()]);
+    const batteryVal = await getBatteryInfo();
+    const cpuVal = Number(cpu.currentLoad?.toFixed?.(2) ?? 0);
+    const ramVal = Number((((mem?.active ?? 0) / (mem?.total ?? 1)) * 100).toFixed(2));
+    const line = `[${new Date().toLocaleString()}] CPU:${cpuVal}% RAM:${ramVal}% Battery:${batteryVal ?? 'N/A'}%`;
     appendLogAsync(line);
   } catch (err) {
     console.error('cron error', err);
   }
 });
 
-/* serve index explicitly */
-app.get('/', (req,res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
+
