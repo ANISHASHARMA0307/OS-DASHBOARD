@@ -19,22 +19,35 @@ const LOG_FILE = path.join(LOG_DIR, 'resource-log.json');
 let thresholds = { cpu: 90, ram: 85, battery: 15 };
 
 // ✅ SAFE battery info function
+// ✅ SAFE battery info function with MOCK fallback
 async function getBatteryInfo() {
   try {
     const battery = await si.battery();
+
+    // If the system has a real battery
     if (battery && battery.hasbattery) {
       return {
         percent: battery.percent ?? 'N/A',
         isCharging: battery.ischarging ?? false,
       };
-    } else {
-      return { percent: 'N/A', isCharging: false };
     }
+
+    // 🧪 MOCK battery fallback (for desktops / testing)
+    console.log('⚠️  No real battery detected — using mock data.');
+    return {
+      percent: Math.floor(Math.random() * (100 - 60 + 1)) + 60, // random between 60–100
+      isCharging: Math.random() > 0.5, // randomly charging or not
+    };
+
   } catch (err) {
     console.error('Battery info error:', err.message);
-    return { percent: 'N/A', isCharging: false };
+    return {
+      percent: Math.floor(Math.random() * (100 - 60 + 1)) + 60,
+      isCharging: Math.random() > 0.5,
+    };
   }
 }
+
 
 // ✅ Function to get system info
 async function getSystemInfo() {
